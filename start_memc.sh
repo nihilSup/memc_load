@@ -7,10 +7,7 @@ declare -a memc_hosts=(
     "127.0.0.1:33016"
 )
 
-if [ "$1" = "stop" ]; then
-    echo "stopping memcached"
-    pkill -f memcached
-else
+start() {
     for host in "${memc_hosts[@]}"; do
         port=(${host//:/ })
         port=${port[1]}
@@ -18,4 +15,21 @@ else
         echo "Starting memcach on $host"
         memcached -d -p $port
     done
-fi
+}
+
+stop () {
+    echo "stopping memcached"
+    pkill -f memcached
+}
+case $1 in
+    "stop")
+        stop
+        ;;
+    "reload")
+        stop
+        start
+        ;;
+    *)
+        start
+        ;;
+esac

@@ -7,6 +7,7 @@ import glob
 import logging
 import collections
 from optparse import OptionParser
+import time
 # brew install protobuf
 # protoc  --python_out=. ./appsinstalled.proto
 # pip install protobuf
@@ -72,11 +73,16 @@ def main(options):
         "adid": options.adid,
         "dvid": options.dvid,
     }
+    script_start_time = time.time()
     for fn in glob.iglob(options.pattern):
         processed = errors = 0
         logging.info('Processing %s' % fn)
         fd = gzip.open(fn)
+        lines_counter = 0
+        start_time = time.time()
         for line in fd:
+            if lines_counter > 15000:
+                break
             line = line.strip()
             if not line:
                 continue
@@ -94,6 +100,13 @@ def main(options):
                 processed += 1
             else:
                 errors += 1
+            lines_counter += 1
+            if lines_counter % 5000 == 0:
+                logging.info('{} lines passed with {} errors'.format(
+                    lines_counter, errors))
+                logging.info('Time for processing 5000 lines: {0:.2f} seconds'.format(
+                    time.time() - start_time))
+                start_time = time.time()
         print(processed)
         if not processed:
             fd.close()
@@ -105,9 +118,12 @@ def main(options):
         if err_rate < NORMAL_ERR_RATE:
             logging.info("Acceptable error rate (%s). Successfull load" % err_rate)
         else:
-            logging.error("High error rate (%s > %s). Failed load" % (err_rate, NORMAL_ERR_RATE))
+            logging.error("High error rate (%s > %s). Failed load" % (
+                err_rate, NORMAL_ERR_RATE))
         fd.close()
         dot_rename(fn)
+    logging.info('Script finished in {0:.2f} seconds'.format(
+        time.time() - script_start_time))
 
 
 def prototest():
@@ -137,8 +153,10 @@ if __name__ == '__main__':
     op.add_option("--adid", action="store", default="127.0.0.1:33015")
     op.add_option("--dvid", action="store", default="127.0.0.1:33016")
     (opts, args) = op.parse_args()
-    logging.basicConfig(filename=opts.log, level=logging.DEBUG if not opts.dry else logging.DEBUG,
-                        format='[%(asctime)s] %(levelname).1s %(message)s', datefmt='%Y.%m.%d %H:%M:%S')
+    logging.basicConfig(filename=opts.log,
+                        level=logging.DEBUG if not opts.dry else logging.DEBUG,
+                        format='[%(asctime)s] %(levelname).1s %(message)s',
+                        datefmt='%Y.%m.%d %H:%M:%S')
     if opts.test:
         prototest()
         sys.exit(0)
