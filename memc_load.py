@@ -8,6 +8,8 @@ import os
 import sys
 import time
 from optparse import OptionParser
+# from multiprocessing.dummy import Pool
+from multiprocessing import Pool
 
 import memcache
 
@@ -36,7 +38,8 @@ def insert_appsinstalled(memc_addr, appsinstalled, dry_run=False):
     # @TODO retry and timeouts!
     try:
         if dry_run:
-            logging.debug("%s - %s -> %s" % (memc_addr, key, str(ua).replace("\n", " ")))
+            logging.debug("%s - %s -> %s" % (memc_addr, key,
+                                             str(ua).replace("\n", " ")))
         else:
             memc = memcache.Client([memc_addr])
             memc.set(key, packed)
@@ -66,56 +69,64 @@ def parse_appsinstalled(line):
     return AppsInstalled(dev_type, dev_id, lat, lon, apps)
 
 
-def process_files(files, device_memc, dry):
-    for fn in files:
-        processed = errors = 0
-        logging.info('Processing %s' % fn)
-        fd = gzip.open(fn)
-        lines_counter = 0
-        start_time = time.time()
-        for line in fd:
-            if lines_counter > 15000:
-                break
-            line = line.strip()
-            if not line:
-                continue
-            appsinstalled = parse_appsinstalled(line)
-            if not appsinstalled:
-                errors += 1
-                continue
-            memc_addr = device_memc.get(appsinstalled.dev_type)
-            if not memc_addr:
-                errors += 1
-                logging.error("Unknow device type: %s" % appsinstalled.dev_type)
-                continue
-            ok = insert_appsinstalled(memc_addr, appsinstalled, dry)
-            if ok:
-                processed += 1
-            else:
-                errors += 1
-            lines_counter += 1
-            if lines_counter % 5000 == 0:
-                logging.info('{} lines passed with {} errors'.format(
-                    lines_counter, errors))
-                logging.info('Time for processing 5000 lines: {0:.2f} seconds'.format(
-                    time.time() - start_time))
-                start_time = time.time()
-        print(processed)
-        if not processed:
-            fd.close()
-            dot_rename(fn)
-            logging.info('file {} was not processed'.format(fn))
-            continue
+def process_line(line, device_memc, dry):
+    if not line:
+        return
+    line = line.strip()
+    appsinstalled = parse_appsinstalled(line)
+    if not appsinstalled:
+        raise Exception('No appsinstalled')
+    memc_addr = device_memc.get(appsinstalled.dev_type)
+    if not memc_addr:
+        raise Exception("Unknow device type: %s" % appsinstalled.dev_type)
+    ok = insert_appsinstalled(memc_addr, appsinstalled, dry)
+    if not ok:
+        raise Exception('Failed to insert appsinstalled')
 
-        err_rate = float(errors) / processed
-        if err_rate < NORMAL_ERR_RATE:
-            logging.info("Acceptable error rate (%s). Successfull load" % err_rate)
+
+def process_file(fn, device_memc, dry):
+    processed = errors = 0
+    logging.info('Processing %s' % fn)
+    fd = gzip.open(fn)
+    lines_counter = 0
+    start_time = time.time()
+    for line in fd:
+        if lines_counter > 15000:
+            break
+        try:
+            process_line(line, device_memc, dry)
+        except Exception as e:
+            logging.exception(e)
+            errors += 1
         else:
-            logging.error("High error rate (%s > %s). Failed load" % (
-                err_rate, NORMAL_ERR_RATE))
+            processed += 1
+        lines_counter += 1
+        if lines_counter % 5000 == 0:
+            logging.info('{} lines passed with {} errors'.format(
+                lines_counter, errors))
+            logging.info(
+                'Time for processing 5000 lines: {0:.2f} seconds'.format(
+                    time.time() - start_time))
+            start_time = time.time()
+    if not processed:
         fd.close()
-        # TODO: uncomment after tests
-        # dot_rename(fn)
+        dot_rename(fn)
+        logging.info('file {} was not processed'.format(fn))
+
+    err_rate = float(errors) / processed
+    if err_rate < NORMAL_ERR_RATE:
+        logging.info("Acceptable error rate (%s). Successfull load" % err_rate)
+    else:
+        logging.error("High error rate (%s > %s). Failed load" % (
+            err_rate, NORMAL_ERR_RATE))
+    fd.close()
+    # TODO: uncomment after tests
+    # dot_rename(fn)
+
+
+def process_files(files, device_memc, dry):
+    with Pool(processes=3) as pool:
+        pool.starmap(process_file, [(fn, device_memc, dry) for fn in files])
 
 
 def main(options):
