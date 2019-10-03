@@ -1,22 +1,22 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-import os
-import gzip
-import sys
-import glob
-import logging
 import collections
-from optparse import OptionParser
+import glob
+import gzip
+import logging
+import os
+import sys
 import time
-# brew install protobuf
-# protoc  --python_out=. ./appsinstalled.proto
-# pip install protobuf
-import appsinstalled_pb2
-# pip install python-memcached
+from optparse import OptionParser
+
 import memcache
 
+import appsinstalled_pb2
+
 NORMAL_ERR_RATE = 0.01
-AppsInstalled = collections.namedtuple("AppsInstalled", ["dev_type", "dev_id", "lat", "lon", "apps"])
+AppsInstalled = collections.namedtuple(
+    "AppsInstalled",
+    ["dev_type", "dev_id", "lat", "lon", "apps"])
 
 
 def dot_rename(path):
@@ -66,15 +66,8 @@ def parse_appsinstalled(line):
     return AppsInstalled(dev_type, dev_id, lat, lon, apps)
 
 
-def main(options):
-    device_memc = {
-        "idfa": options.idfa,
-        "gaid": options.gaid,
-        "adid": options.adid,
-        "dvid": options.dvid,
-    }
-    script_start_time = time.time()
-    for fn in glob.iglob(options.pattern):
+def process_files(files, device_memc, dry):
+    for fn in files:
         processed = errors = 0
         logging.info('Processing %s' % fn)
         fd = gzip.open(fn)
@@ -95,7 +88,7 @@ def main(options):
                 errors += 1
                 logging.error("Unknow device type: %s" % appsinstalled.dev_type)
                 continue
-            ok = insert_appsinstalled(memc_addr, appsinstalled, options.dry)
+            ok = insert_appsinstalled(memc_addr, appsinstalled, dry)
             if ok:
                 processed += 1
             else:
@@ -121,7 +114,20 @@ def main(options):
             logging.error("High error rate (%s > %s). Failed load" % (
                 err_rate, NORMAL_ERR_RATE))
         fd.close()
-        dot_rename(fn)
+        # TODO: uncomment after tests
+        # dot_rename(fn)
+
+
+def main(options):
+    device_memc = {
+        "idfa": options.idfa,
+        "gaid": options.gaid,
+        "adid": options.adid,
+        "dvid": options.dvid,
+    }
+    script_start_time = time.time()
+    files = glob.iglob(options.pattern)
+    process_files(files, device_memc, options.dry)
     logging.info('Script finished in {0:.2f} seconds'.format(
         time.time() - script_start_time))
 
