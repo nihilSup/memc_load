@@ -8,12 +8,17 @@ import os
 import sys
 import time
 from optparse import OptionParser
-# from multiprocessing.dummy import Pool
-from multiprocessing import Pool
+from multiprocessing.dummy import Pool
+from multiprocessing import Queue, Process, Event
+# from multiprocessing import Pool
+from threading import Thread
+# from signal import signal, SIGPIPE, SIG_DFL
 
 import memcache
 
 import appsinstalled_pb2
+
+# signal(SIGPIPE, SIG_DFL)
 
 NORMAL_ERR_RATE = 0.01
 AppsInstalled = collections.namedtuple(
@@ -124,47 +129,210 @@ def process_file(fn, device_memc, dry):
     # dot_rename(fn)
 
 
-def process_files(files, device_memc, dry):
-    with Pool(processes=3) as pool:
-        pool.starmap(process_file, [(fn, device_memc, dry) for fn in files])
+class FilesReader(object):
+
+    def __init__(self, queue):
+        self.queue = queue
+
+    def read_file(self, filename):
+        start_time = time.time()
+        logging.info('Processing %s' % filename)
+        with gzip.open(filename) as fd:
+            lines_counter = 0
+            for line in fd:
+                if lines_counter > 15000:
+                    break
+                self.queue.put(line, timeout=15)
+                lines_counter += 1
+                if lines_counter % 5000 == 0:
+                    logging.info(
+                        'Read 5000 lines in: {0:.2f} seconds'.format(
+                            time.time() - start_time))
+                    start_time = time.time()
+
+    def __call__(self, files):
+        with Pool(processes=3) as pool:
+            try:
+                pool.map(self.read_file, [fn for fn in files])
+            except KeyboardInterrupt:
+                logging.info('Shut down pool')
+        logging.info('FilesReader finished')
+
+
+class LineParser(Process):
+
+    def __init__(self, src_queue, parsed_queue, *args, **kwargs):
+        self.src_queue = src_queue
+        self.parsed_queue = parsed_queue
+        self._stop = Event()
+        super().__init__(*args, **kwargs)
+
+    def _parse_appsinstalled(self, line):
+        # TODO: refactor as factory method of Appsinstalled class
+        if not line:
+            raise Exception('Empty line')
+        line = line.strip()
+        line = line.decode('UTF-8')
+        line_parts = line.strip().split("\t")
+        if len(line_parts) < 5:
+            raise Exception('Too few line parts. 5 or more expected')
+        dev_type, dev_id, lat, lon, raw_apps = line_parts
+        if not dev_type or not dev_id:
+            raise Exception('No dev_type or dev_id')
+        try:
+            apps = [int(a.strip()) for a in raw_apps.split(",")]
+        except ValueError:
+            apps = [int(a.strip())
+                    for a in raw_apps.split(",") if a.isidigit()]
+            logging.info("Not all user apps are digits: `%s`" % line)
+        try:
+            lat, lon = float(lat), float(lon)
+        except ValueError:
+            logging.info("Invalid geo coords: `%s`" % line)
+        return AppsInstalled(dev_type, dev_id, lat, lon, apps)
+
+    def parse_lines(self):
+        counter = successes = fails = 0
+        start_time = time.time()
+        while not self._stop.is_set():
+            if self.src_queue.empty():
+                time.sleep(0.2)
+                continue
+            line = self.src_queue.get()
+            try:
+                appsinstalled = self._parse_appsinstalled(line)
+            except Exception as e:
+                logging.exception(e)
+                fails += 1
+            else:
+                successes += 1
+                self.parsed_queue.put(appsinstalled, timeout=15)
+            counter += 1
+            if counter % 5000 == 0:
+                avg_time = (time.time() - start_time) / 5000
+                logging.info('Parsed 5000 lines. Avg time: {}'.format(
+                    avg_time))
+        logging.info('Parser finished')
+        err_rate = float(fails) / successes
+        if err_rate < NORMAL_ERR_RATE:
+            logging.info("Acceptable processing error rate (%s)" % err_rate)
+        else:
+            logging.error("High error rate (%s > %s). Failed process" % (
+                err_rate, NORMAL_ERR_RATE))
+
+    def run(self):
+        self.parse_lines()
+
+    def stop(self):
+        self._stop.set()
+
+
+class MemcachedPoster(Thread):
+
+    def __init__(self, queue, device_memc, dry_run, *args, **kwargs):
+        self.__stop = False
+        self.queue = queue
+        self.dry_run = dry_run
+        self.device_memc = device_memc
+        super().__init__(*args, **kwargs)
+
+    def insert_appsinstalled(self, memc_addr, appsinstalled):
+        ua = appsinstalled_pb2.UserApps()
+        ua.lat = appsinstalled.lat
+        ua.lon = appsinstalled.lon
+        key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
+        ua.apps.extend(appsinstalled.apps)
+        packed = ua.SerializeToString()
+        # @TODO persistent connection
+        # @TODO retry and timeouts!
+        if self.dry_run:
+            logging.debug("%s - %s -> %s" % (memc_addr, key,
+                                             str(ua).replace("\n", " ")))
+        else:
+            memc = memcache.Client([memc_addr])
+            memc.set(key, packed)
+
+    def run(self):
+        counter = successes = fails = 0
+        start_time = time.time()
+        while not self.__stop:
+            if self.queue.empty():
+                time.sleep(0.2)
+                continue
+            appsinstalled = self.queue.get(timeout=5)
+            memc_addr = self.device_memc.get(appsinstalled.dev_type)
+            if not memc_addr:
+                fails += 1
+                continue
+            try:
+                self.insert_appsinstalled(memc_addr, appsinstalled)
+            except Exception as e:
+                logging.exception(e)
+                fails += 1
+            else:
+                successes += 1
+            counter += 1
+            if counter % 5000 == 0:
+                avg_time = (time.time() - start_time) / 5000
+                logging.info('Inserted 5000 lines. Avg time: {}'.format(
+                    avg_time))
+        logging.info('Finished insertion')
+        err_rate = float(fails) / successes
+        if err_rate < NORMAL_ERR_RATE:
+            logging.info("Acceptable processing error rate (%s)" % err_rate)
+        else:
+            logging.error("High error rate (%s > %s). Failed process" % (
+                err_rate, NORMAL_ERR_RATE))
+
+    def stop(self):
+        self.__stop = True
 
 
 def main(options):
+    script_start_time = time.time()
     device_memc = {
         "idfa": options.idfa,
         "gaid": options.gaid,
         "adid": options.adid,
         "dvid": options.dvid,
     }
-    script_start_time = time.time()
+    raw_queue = Queue(maxsize=2000)
+    parsed_queue = Queue(maxsize=2000)
+
     files = glob.iglob(options.pattern)
-    process_files(files, device_memc, options.dry)
+    freader_thr = Thread(target=FilesReader(raw_queue), args=(files,))
+    freader_thr.start()
+
+    printer_proc = LineParser(raw_queue, parsed_queue)
+    printer_proc.start()
+
+    poster_thr = MemcachedPoster(parsed_queue, device_memc, options.dry)
+    poster_thr.start()
+
+    try:
+        freader_thr.join()
+        printer_proc.stop()
+        printer_proc.join()
+        poster_thr.stop()
+        poster_thr.join()
+        raw_queue.close()
+        raw_queue.join_thread()
+        parsed_queue.close()
+        parsed_queue.join_thread()
+    except KeyboardInterrupt:
+        # TODO: add proper handling
+        sys.exit(1)
+
     logging.info('Script finished in {0:.2f} seconds'.format(
         time.time() - script_start_time))
 
 
-def prototest():
-    sample = "idfa\t1rfw452y52g2gq4g\t55.55\t42.42\t1423,43,567,3,7,23\ngaid\t7rfw452y52g2gq4g\t55.55\t42.42\t7423,424"
-    for line in sample.splitlines():
-        dev_type, dev_id, lat, lon, raw_apps = line.strip().split("\t")
-        apps = [int(a) for a in raw_apps.split(",") if a.isdigit()]
-        lat, lon = float(lat), float(lon)
-        ua = appsinstalled_pb2.UserApps()
-        ua.lat = lat
-        ua.lon = lon
-        ua.apps.extend(apps)
-        packed = ua.SerializeToString()
-        unpacked = appsinstalled_pb2.UserApps()
-        unpacked.ParseFromString(packed)
-        assert ua == unpacked
-
-
 if __name__ == '__main__':
     op = OptionParser()
-    op.add_option("-t", "--test", action="store_true", default=False)
     op.add_option("-l", "--log", action="store", default=None)
     op.add_option("--dry", action="store_true", default=False)
-    op.add_option("--pattern", action="store", default="/data/appsinstalled/*.tsv.gz")
+    op.add_option("--pattern", action="store",
+                  default="/data/appsinstalled/*.tsv.gz")
     op.add_option("--idfa", action="store", default="127.0.0.1:33013")
     op.add_option("--gaid", action="store", default="127.0.0.1:33014")
     op.add_option("--adid", action="store", default="127.0.0.1:33015")
@@ -174,9 +342,6 @@ if __name__ == '__main__':
                         level=logging.DEBUG if not opts.dry else logging.DEBUG,
                         format='[%(asctime)s] %(levelname).1s %(message)s',
                         datefmt='%Y.%m.%d %H:%M:%S')
-    if opts.test:
-        prototest()
-        sys.exit(0)
 
     logging.info("Memc loader started with options: %s" % opts)
     try:
