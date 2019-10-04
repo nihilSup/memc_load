@@ -246,6 +246,31 @@ class LineParser(Process):
         self._stop.set()
 
 
+class BufferedMemcLoader(object):
+
+    def __init__(self, device_memc, buff_size=1000):
+        self.clients = {memc_addr: memcache.Client([memc_addr])
+                        for _, memc_addr in device_memc.items()}
+        self.buffs = {memc_addr: [] for _, memc_addr in device_memc.items()}
+        self.buff_size = buff_size
+
+    def load(self, memc_addr, key, value):
+        memc_client = self.clients[memc_addr]
+        buff = self.buffs[memc_addr]
+        buff.append((key, value))
+        if len(buff) == self.buff_size:
+            for key, value in buff:
+                memc_client.set(key, value)
+            del buff[:]
+
+    def flush(self):
+        for memc_addr, memc_client in self.clients.items():
+            buff = self.buffs[memc_addr]
+            for key, value in buff:
+                memc_client.set(key, value)
+            del buff[:]
+
+
 class MemcachedPoster(Thread):
 
     def __init__(self, queue, device_memc, dry_run, *args, **kwargs):
@@ -258,8 +283,7 @@ class MemcachedPoster(Thread):
     def run(self):
         start_time = time.time()
         counter = successes = fails = 0
-        memc_clients = {memc_addr: memcache.Client([memc_addr])
-                        for dev_type, memc_addr in self.device_memc.items()}
+        memc_loader = BufferedMemcLoader(self.device_memc)
         while not self.__stop:
             if self.queue.empty():
                 time.sleep(0.2)
@@ -270,8 +294,7 @@ class MemcachedPoster(Thread):
                     logging.debug("%s - %s -> %s" % (memc_addr, key,
                                                      packed.replace("\n", " ")))
                 else:
-                    memc = memc_clients[memc_addr]
-                    memc.set(key, packed)
+                    memc_loader.load(memc_addr, key, packed)
             except Exception as e:
                 logging.exception(e)
                 fails += 1
@@ -282,6 +305,7 @@ class MemcachedPoster(Thread):
                 avg_time = (time.time() - start_time) / 5000
                 logging.info('Inserted 5000 lines. Avg time: {}'.format(
                     avg_time))
+        memc_loader.flush
         logging.info('Finished insertion')
         err_rate = float(fails) / successes
         if err_rate < NORMAL_ERR_RATE:
