@@ -248,32 +248,30 @@ class LineParser(Process):
 
 class MemcachedPoster(Thread):
 
-    def __init__(self, queue, dry_run, *args, **kwargs):
+    def __init__(self, queue, device_memc, dry_run, *args, **kwargs):
         self.__stop = False
         self.queue = queue
+        self.device_memc = device_memc
         self.dry_run = dry_run
         super().__init__(*args, **kwargs)
 
-    def insert_appsinstalled(self, memc_addr, key, packed):
-        # @TODO persistent connection
-        # @TODO retry and timeouts!
-        if self.dry_run:
-            logging.debug("%s - %s -> %s" % (memc_addr, key,
-                                             packed.replace("\n", " ")))
-        else:
-            memc = memcache.Client([memc_addr])
-            memc.set(key, packed)
-
     def run(self):
-        counter = successes = fails = 0
         start_time = time.time()
+        counter = successes = fails = 0
+        memc_clients = {memc_addr: memcache.Client([memc_addr])
+                        for dev_type, memc_addr in self.device_memc.items()}
         while not self.__stop:
             if self.queue.empty():
                 time.sleep(0.2)
                 continue
             memc_addr, key, packed = self.queue.get(timeout=5)
             try:
-                self.insert_appsinstalled(memc_addr, key, packed)
+                if self.dry_run:
+                    logging.debug("%s - %s -> %s" % (memc_addr, key,
+                                                     packed.replace("\n", " ")))
+                else:
+                    memc = memc_clients[memc_addr]
+                    memc.set(key, packed)
             except Exception as e:
                 logging.exception(e)
                 fails += 1
@@ -335,7 +333,8 @@ def main(options):
     parser_crew = WorkCrew(2, LineParser, raw_queue, parsed_queue, device_memc)
     parser_crew.start()
 
-    poster_crew = WorkCrew(3, MemcachedPoster, parsed_queue, options.dry)
+    poster_crew = WorkCrew(3, MemcachedPoster, parsed_queue, device_memc,
+                           options.dry)
     poster_crew.start()
 
     try:
