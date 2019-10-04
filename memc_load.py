@@ -161,9 +161,11 @@ class FilesReader(object):
 
 class LineParser(Process):
 
-    def __init__(self, src_queue, parsed_queue, *args, **kwargs):
+    def __init__(self, src_queue, parsed_queue, device_memc,
+                 *args, **kwargs):
         self.src_queue = src_queue
         self.parsed_queue = parsed_queue
+        self.device_memc = device_memc
         self._stop = Event()
         super().__init__(*args, **kwargs)
 
@@ -191,6 +193,21 @@ class LineParser(Process):
             logging.info("Invalid geo coords: `%s`" % line)
         return AppsInstalled(dev_type, dev_id, lat, lon, apps)
 
+    def _serialize(self, appsinstalled):
+        ua = appsinstalled_pb2.UserApps()
+        ua.lat = appsinstalled.lat
+        ua.lon = appsinstalled.lon
+        key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
+        ua.apps.extend(appsinstalled.apps)
+        packed = ua.SerializeToString()
+        return key, packed
+
+    def _get_memc_addr(self, appsinstalled):
+        memc_addr = self.device_memc.get(appsinstalled.dev_type)
+        if not memc_addr:
+            raise Exception('No memc_addr')
+        return memc_addr
+
     def parse_lines(self):
         counter = successes = fails = 0
         start_time = time.time()
@@ -201,12 +218,14 @@ class LineParser(Process):
             line = self.src_queue.get()
             try:
                 appsinstalled = self._parse_appsinstalled(line)
+                memc_addr = self._get_memc_addr(appsinstalled)
+                key, packed = self._serialize(appsinstalled)
             except Exception as e:
                 logging.exception(e)
                 fails += 1
             else:
                 successes += 1
-                self.parsed_queue.put(appsinstalled, timeout=15)
+                self.parsed_queue.put((memc_addr, key, packed), timeout=15)
             counter += 1
             if counter % 5000 == 0:
                 avg_time = (time.time() - start_time) / 5000
@@ -229,25 +248,18 @@ class LineParser(Process):
 
 class MemcachedPoster(Thread):
 
-    def __init__(self, queue, device_memc, dry_run, *args, **kwargs):
+    def __init__(self, queue, dry_run, *args, **kwargs):
         self.__stop = False
         self.queue = queue
         self.dry_run = dry_run
-        self.device_memc = device_memc
         super().__init__(*args, **kwargs)
 
-    def insert_appsinstalled(self, memc_addr, appsinstalled):
-        ua = appsinstalled_pb2.UserApps()
-        ua.lat = appsinstalled.lat
-        ua.lon = appsinstalled.lon
-        key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
-        ua.apps.extend(appsinstalled.apps)
-        packed = ua.SerializeToString()
+    def insert_appsinstalled(self, memc_addr, key, packed):
         # @TODO persistent connection
         # @TODO retry and timeouts!
         if self.dry_run:
             logging.debug("%s - %s -> %s" % (memc_addr, key,
-                                             str(ua).replace("\n", " ")))
+                                             packed.replace("\n", " ")))
         else:
             memc = memcache.Client([memc_addr])
             memc.set(key, packed)
@@ -259,13 +271,9 @@ class MemcachedPoster(Thread):
             if self.queue.empty():
                 time.sleep(0.2)
                 continue
-            appsinstalled = self.queue.get(timeout=5)
-            memc_addr = self.device_memc.get(appsinstalled.dev_type)
-            if not memc_addr:
-                fails += 1
-                continue
+            memc_addr, key, packed = self.queue.get(timeout=5)
             try:
-                self.insert_appsinstalled(memc_addr, appsinstalled)
+                self.insert_appsinstalled(memc_addr, key, packed)
             except Exception as e:
                 logging.exception(e)
                 fails += 1
@@ -288,6 +296,27 @@ class MemcachedPoster(Thread):
         self.__stop = True
 
 
+class WorkCrew(object):
+
+    def __init__(self, num_workers, worker_cls, *wrk_args, **wrk_kwargs):
+        self.num_workers = num_workers
+        self.worker_cls = worker_cls
+        self.crew = [worker_cls(*wrk_args, **wrk_kwargs)
+                     for _ in range(num_workers)]
+
+    def start(self):
+        for worker in self.crew:
+            worker.start()
+
+    def stop(self):
+        for worker in self.crew:
+            worker.stop()
+
+    def join(self):
+        for worker in self.crew:
+            worker.join()
+
+
 def main(options):
     script_start_time = time.time()
     device_memc = {
@@ -303,18 +332,18 @@ def main(options):
     freader_thr = Thread(target=FilesReader(raw_queue), args=(files,))
     freader_thr.start()
 
-    printer_proc = LineParser(raw_queue, parsed_queue)
-    printer_proc.start()
+    parser_crew = WorkCrew(2, LineParser, raw_queue, parsed_queue, device_memc)
+    parser_crew.start()
 
-    poster_thr = MemcachedPoster(parsed_queue, device_memc, options.dry)
-    poster_thr.start()
+    poster_crew = WorkCrew(3, MemcachedPoster, parsed_queue, options.dry)
+    poster_crew.start()
 
     try:
         freader_thr.join()
-        printer_proc.stop()
-        printer_proc.join()
-        poster_thr.stop()
-        poster_thr.join()
+        parser_crew.stop()
+        parser_crew.join()
+        poster_crew.stop()
+        poster_crew.join()
         raw_queue.close()
         raw_queue.join_thread()
         parsed_queue.close()
