@@ -32,103 +32,6 @@ def dot_rename(path):
     os.rename(path, os.path.join(head, "." + fn))
 
 
-def insert_appsinstalled(memc_addr, appsinstalled, dry_run=False):
-    ua = appsinstalled_pb2.UserApps()
-    ua.lat = appsinstalled.lat
-    ua.lon = appsinstalled.lon
-    key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
-    ua.apps.extend(appsinstalled.apps)
-    packed = ua.SerializeToString()
-    # @TODO persistent connection
-    # @TODO retry and timeouts!
-    try:
-        if dry_run:
-            logging.debug("%s - %s -> %s" % (memc_addr, key,
-                                             str(ua).replace("\n", " ")))
-        else:
-            memc = memcache.Client([memc_addr])
-            memc.set(key, packed)
-    except Exception as e:
-        logging.exception("Cannot write to memc %s: %s" % (memc_addr, e))
-        return False
-    return True
-
-
-def parse_appsinstalled(line):
-    line = line.decode('UTF-8')
-    line_parts = line.strip().split("\t")
-    if len(line_parts) < 5:
-        return
-    dev_type, dev_id, lat, lon, raw_apps = line_parts
-    if not dev_type or not dev_id:
-        return
-    try:
-        apps = [int(a.strip()) for a in raw_apps.split(",")]
-    except ValueError:
-        apps = [int(a.strip()) for a in raw_apps.split(",") if a.isidigit()]
-        logging.info("Not all user apps are digits: `%s`" % line)
-    try:
-        lat, lon = float(lat), float(lon)
-    except ValueError:
-        logging.info("Invalid geo coords: `%s`" % line)
-    return AppsInstalled(dev_type, dev_id, lat, lon, apps)
-
-
-def process_line(line, device_memc, dry):
-    if not line:
-        return
-    line = line.strip()
-    appsinstalled = parse_appsinstalled(line)
-    if not appsinstalled:
-        raise Exception('No appsinstalled')
-    memc_addr = device_memc.get(appsinstalled.dev_type)
-    if not memc_addr:
-        raise Exception("Unknow device type: %s" % appsinstalled.dev_type)
-    ok = insert_appsinstalled(memc_addr, appsinstalled, dry)
-    if not ok:
-        raise Exception('Failed to insert appsinstalled')
-
-
-def process_file(fn, device_memc, dry):
-    processed = errors = 0
-    logging.info('Processing %s' % fn)
-    fd = gzip.open(fn)
-    lines_counter = 0
-    start_time = time.time()
-    for line in fd:
-        if lines_counter > 15000:
-            break
-        try:
-            process_line(line, device_memc, dry)
-        except Exception as e:
-            logging.exception(e)
-            errors += 1
-        else:
-            processed += 1
-        lines_counter += 1
-        if lines_counter % 5000 == 0:
-            logging.info('{} lines passed with {} errors'.format(
-                lines_counter, errors))
-            logging.info(
-                'Time for processing 5000 lines: {0:.2f} seconds'.format(
-                    time.time() - start_time))
-            start_time = time.time()
-    if not processed:
-        fd.close()
-        dot_rename(fn)
-        logging.info('file {} was not processed'.format(fn))
-
-    err_rate = float(errors) / processed
-    if err_rate < NORMAL_ERR_RATE:
-        logging.info("Acceptable error rate (%s). Successfull load" % err_rate)
-    else:
-        logging.error("High error rate (%s > %s). Failed load" % (
-            err_rate, NORMAL_ERR_RATE))
-    fd.close()
-    # TODO: uncomment after tests
-    # dot_rename(fn)
-
-
 class FilesReader(object):
 
     def __init__(self, queue):
@@ -149,6 +52,8 @@ class FilesReader(object):
                         'Read 5000 lines in: {0:.2f} seconds'.format(
                             time.time() - start_time))
                     start_time = time.time()
+        # dot_rename(filename)
+
 
     def __call__(self, files):
         with Pool(processes=3) as pool:
@@ -307,6 +212,7 @@ class MemcachedPoster(Thread):
                 avg_time = (time.time() - start_time) / 5000
                 logging.info('Inserted 5000 lines. Avg time: {}'.format(
                     avg_time))
+                logging.debug('Put data example {}:{}'.format(key, packed))
         memc_loader.flush
         logging.info('Finished insertion')
         err_rate = float(fails) / successes
@@ -393,7 +299,7 @@ if __name__ == '__main__':
     op.add_option("--dvid", action="store", default="127.0.0.1:33016")
     (opts, args) = op.parse_args()
     logging.basicConfig(filename=opts.log,
-                        level=logging.DEBUG if not opts.dry else logging.DEBUG,
+                        level=logging.INFO if not opts.dry else logging.DEBUG,
                         format='[%(asctime)s] %(levelname).1s %(message)s',
                         datefmt='%Y.%m.%d %H:%M:%S')
 
