@@ -291,8 +291,10 @@ class MemcachedPoster(Thread):
             memc_addr, key, packed = self.queue.get(timeout=5)
             try:
                 if self.dry_run:
-                    logging.debug("%s - %s -> %s" % (memc_addr, key,
-                                                     packed.replace("\n", " ")))
+                    logging.debug("%s - %s -> %s" % (
+                        memc_addr, key,
+                        packed.replace("\n", " "))
+                    )
                 else:
                     memc_loader.load(memc_addr, key, packed)
             except Exception as e:
