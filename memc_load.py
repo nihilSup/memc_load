@@ -160,21 +160,23 @@ class BufferedMemcLoader(object):
         self.buffs = {memc_addr: [] for _, memc_addr in device_memc.items()}
         self.buff_size = buff_size
 
-    def load(self, memc_addr, key, value):
+    def drain_buff(self, memc_addr):
         memc_client = self.clients[memc_addr]
+        buff = self.buffs[memc_addr]
+        for key, value in buff:
+            memc_client.set(key, value)
+        del buff[:]
+
+    def load(self, memc_addr, key, value):
         buff = self.buffs[memc_addr]
         buff.append((key, value))
         if len(buff) == self.buff_size:
-            for key, value in buff:
-                memc_client.set(key, value)
-            del buff[:]
+            logging.debug('{} buffer is full, draining'.format(memc_addr))
+            self.drain_buff(memc_addr)
 
     def flush(self):
-        for memc_addr, memc_client in self.clients.items():
-            buff = self.buffs[memc_addr]
-            for key, value in buff:
-                memc_client.set(key, value)
-            del buff[:]
+        for memc_addr in self.clients:
+            self.drain_buff(memc_addr)
 
 
 class MemcachedPoster(Thread):
@@ -215,7 +217,7 @@ class MemcachedPoster(Thread):
                 logging.info('Inserted 5000 lines. Avg time: {}'.format(
                     avg_time))
                 logging.debug('Put data example {}:{}'.format(key, packed))
-        memc_loader.flush
+        memc_loader.flush()
         logging.info('Finished insertion')
         err_rate = float(fails) / successes
         if err_rate < NORMAL_ERR_RATE:
@@ -277,20 +279,13 @@ def main(options):
         parser_crew.join()
         poster_crew.stop()
         poster_crew.join()
-        logging.debug('Stopped workers')
-        # raw_queue.close()
-        # raw_queue.join_thread()
-        # parsed_queue.close()
-        # parsed_queue.join_thread()
+        logging.debug('Workers stopped')
         if not raw_queue.empty():
             logging.info('raw queue is not empty')
         if not parsed_queue.empty():
             logging.info('parsed queue is not empty')
     except KeyboardInterrupt:
-        # TODO: add proper handling
-        sys.exit(1)
-
-    logging.info('!!!!!!!!!!!!!!!!!!!!!!!!!!')
+        sys.exit()
     logging.info('Script finished in {0:.2f} seconds'.format(
         time.time() - script_start_time))
 
