@@ -8,6 +8,7 @@ import os
 import sys
 import time
 from optparse import OptionParser
+import queue
 from multiprocessing.dummy import Pool
 from multiprocessing import Queue, Process, Event
 # from multiprocessing import Pool
@@ -53,7 +54,6 @@ class FilesReader(object):
                             time.time() - start_time))
                     start_time = time.time()
         # dot_rename(filename)
-
 
     def __call__(self, files):
         with Pool(processes=3) as pool:
@@ -116,11 +116,12 @@ class LineParser(Process):
     def parse_lines(self):
         counter = successes = fails = 0
         start_time = time.time()
-        while not self._stop.is_set():
-            if self.src_queue.empty():
+        while not self._stop.is_set() or not self.src_queue.empty():
+            try:
+                line = self.src_queue.get(timeout=1)
+            except queue.Empty:
                 time.sleep(0.2)
                 continue
-            line = self.src_queue.get()
             try:
                 appsinstalled = self._parse_appsinstalled(line)
                 memc_addr = self._get_memc_addr(appsinstalled)
@@ -189,11 +190,12 @@ class MemcachedPoster(Thread):
         start_time = time.time()
         counter = successes = fails = 0
         memc_loader = BufferedMemcLoader(self.device_memc)
-        while not self.__stop:
-            if self.queue.empty():
+        while not self.__stop or not self.queue.empty():
+            try:
+                memc_addr, key, packed = self.queue.get(timeout=1)
+            except queue.Empty:
                 time.sleep(0.2)
                 continue
-            memc_addr, key, packed = self.queue.get(timeout=5)
             try:
                 if self.dry_run:
                     logging.debug("%s - %s -> %s" % (
@@ -275,14 +277,20 @@ def main(options):
         parser_crew.join()
         poster_crew.stop()
         poster_crew.join()
-        raw_queue.close()
-        raw_queue.join_thread()
-        parsed_queue.close()
-        parsed_queue.join_thread()
+        logging.debug('Stopped workers')
+        # raw_queue.close()
+        # raw_queue.join_thread()
+        # parsed_queue.close()
+        # parsed_queue.join_thread()
+        if not raw_queue.empty():
+            logging.info('raw queue is not empty')
+        if not parsed_queue.empty():
+            logging.info('parsed queue is not empty')
     except KeyboardInterrupt:
         # TODO: add proper handling
         sys.exit(1)
 
+    logging.info('!!!!!!!!!!!!!!!!!!!!!!!!!!')
     logging.info('Script finished in {0:.2f} seconds'.format(
         time.time() - script_start_time))
 
