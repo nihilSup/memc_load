@@ -10,7 +10,7 @@ import time
 from optparse import OptionParser
 import queue
 from multiprocessing.dummy import Pool
-from multiprocessing import Queue, Process, Event
+from multiprocessing import Queue, Process, Event, cpu_count
 # from multiprocessing import Pool
 from threading import Thread
 # from signal import signal, SIGPIPE, SIG_DFL
@@ -44,8 +44,6 @@ class FilesReader(object):
         with gzip.open(filename) as fd:
             lines_counter = 0
             for line in fd:
-                if lines_counter > 15000:
-                    break
                 self.queue.put(line, timeout=15)
                 lines_counter += 1
                 if lines_counter % 5000 == 0:
@@ -138,7 +136,7 @@ class LineParser(Process):
                 logging.info('Parsed 5000 lines. Avg time: {}'.format(
                     avg_time))
         logging.info('Parser finished')
-        err_rate = float(fails) / successes
+        err_rate = float(fails) / successes if successes else 0
         if err_rate < NORMAL_ERR_RATE:
             logging.info("Acceptable processing error rate (%s)" % err_rate)
         else:
@@ -219,7 +217,7 @@ class MemcachedPoster(Thread):
                 logging.debug('Put data example {}:{}'.format(key, packed))
         memc_loader.flush()
         logging.info('Finished insertion')
-        err_rate = float(fails) / successes
+        err_rate = float(fails) / successes if successes else 0
         if err_rate < NORMAL_ERR_RATE:
             logging.info("Acceptable processing error rate (%s)" % err_rate)
         else:
@@ -266,10 +264,13 @@ def main(options):
     freader_thr = Thread(target=FilesReader(raw_queue), args=(files,))
     freader_thr.start()
 
-    parser_crew = WorkCrew(2, LineParser, raw_queue, parsed_queue, device_memc)
+    num_processes = cpu_count()
+    logging.info('Starting crew of {} processes'.format(num_processes))
+    parser_crew = WorkCrew(num_processes, LineParser, raw_queue, parsed_queue,
+                           device_memc)
     parser_crew.start()
 
-    poster_crew = WorkCrew(3, MemcachedPoster, parsed_queue, device_memc,
+    poster_crew = WorkCrew(10, MemcachedPoster, parsed_queue, device_memc,
                            options.dry)
     poster_crew.start()
 
