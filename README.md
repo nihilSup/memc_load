@@ -1,5 +1,7 @@
 # memc load
 
+Searches files by pattern. Every line in each file are parsed (assumed it is some log entry) and packed by protobuf and then posted to memcached. Where is possible threads and processes are used.
+
 ## Installation
 
 ### Install protobuf
