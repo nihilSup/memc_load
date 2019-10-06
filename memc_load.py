@@ -34,6 +34,9 @@ def dot_rename(path):
 
 
 class FilesReader(object):
+    """
+    Loads lines from files. Each file handled in separate thread.
+    """
 
     def __init__(self, queue):
         self.queue = queue
@@ -63,6 +66,9 @@ class FilesReader(object):
 
 
 class LineParser(Process):
+    """
+    CPU bound parse line task handler.
+    """
 
     def __init__(self, src_queue, parsed_queue, device_memc,
                  *args, **kwargs):
@@ -151,6 +157,9 @@ class LineParser(Process):
 
 
 class BufferedMemcLoader(object):
+    """
+    Buffers data before send to memcached
+    """
 
     def __init__(self, device_memc, buff_size=1000):
         self.clients = {memc_addr: memcache.Client([memc_addr])
@@ -178,6 +187,9 @@ class BufferedMemcLoader(object):
 
 
 class MemcachedPoster(Thread):
+    """
+    Throws data to memcached
+    """
 
     def __init__(self, queue, device_memc, dry_run, *args, **kwargs):
         self.__stop = False
@@ -264,6 +276,8 @@ def main(options):
     freader_thr = Thread(target=FilesReader(raw_queue), args=(files,))
     freader_thr.start()
 
+    # TODO: maybe it is better to use Process Pool here? I don't like
+    # reinventing wheel with WorkCrew class.
     num_processes = cpu_count()
     logging.info('Starting crew of {} processes'.format(num_processes))
     parser_crew = WorkCrew(num_processes, LineParser, raw_queue, parsed_queue,
